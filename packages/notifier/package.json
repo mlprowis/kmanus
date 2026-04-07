@@ -1,0 +1,26 @@
+{
+  "name": "@grvt-grid/notifier",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0",
+    "sqlite3": "^5.1.7",
+    "undici": "^7.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/sqlite3": "^3.1.11",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}
