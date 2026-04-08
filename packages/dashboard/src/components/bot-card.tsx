@@ -55,9 +55,17 @@ export function BotCard({ bot, tick }: BotCardProps) {
   return (
     <Link
       to={`/bots/${bot.id}`}
-      className="block hover:no-underline focus-visible:outline-none"
+      // The Link itself gets no outline because we move the focus indicator
+      // to the Card border below — more on-style. The global *:focus-visible
+      // rule in globals.css would otherwise paint a primary outline outside
+      // the card border, which clashes with the rounded corners.
+      className="block hover:no-underline focus-visible:outline-none focus-visible:[&_div[data-card]]:border-primary"
+      aria-label={`Open bot ${bot.id} ${bot.pair} ${bot.direction} ${bot.leverage}x`}
     >
-      <Card className="hover:border-border-default cursor-pointer p-5">
+      <Card
+        data-card
+        className="hover:border-border-default cursor-pointer p-5 transition-colors"
+      >
         {/* Header */}
         <div className="flex items-start justify-between mb-3">
           <div>

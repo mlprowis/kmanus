@@ -3,7 +3,7 @@
 //
 // Used by the CreateBotWizard and any future destructive-confirm dialog.
 
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useId, useRef, type ReactNode } from 'react';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/cn';
 
@@ -33,6 +33,8 @@ export function Modal({
   footer,
 }: ModalProps) {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const titleId = useId();
+  const descId = useId();
 
   // Sync open prop with the imperative dialog API.
   useEffect(() => {
@@ -69,12 +71,18 @@ export function Modal({
       )}
       aria-modal="true"
       role="dialog"
+      aria-labelledby={titleId}
+      aria-describedby={description ? descId : undefined}
     >
       <header className="flex items-start justify-between px-6 py-4 border-b border-border-subtle">
         <div>
-          <h2 className="text-lg font-semibold text-text-primary">{title}</h2>
+          <h2 id={titleId} className="text-lg font-semibold text-text-primary">
+            {title}
+          </h2>
           {description && (
-            <p className="text-xs text-text-muted mt-0.5">{description}</p>
+            <p id={descId} className="text-xs text-text-muted mt-0.5">
+              {description}
+            </p>
           )}
         </div>
         <button

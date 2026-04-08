@@ -41,8 +41,17 @@ export function EquityCurve({ snapshots, height = 240 }: EquityCurveProps) {
   const isUp = last >= first;
   const stroke = isUp ? '#22C55E' : '#EF4444';
 
+  const pctChange = first > 0 ? ((last - first) / first) * 100 : 0;
+  const ariaLabel = `Equity curve ${snapshots.length} daily snapshots ${
+    isUp ? 'up' : 'down'
+  } ${pctChange.toFixed(1)}% from ${first.toFixed(2)} to ${last.toFixed(2)}`;
+
   return (
-    <div style={{ width: '100%', height }}>
+    <div
+      style={{ width: '100%', height }}
+      role="img"
+      aria-label={ariaLabel}
+    >
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart
           data={data}

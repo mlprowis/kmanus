@@ -94,6 +94,16 @@ export function DataTable<T>({
                 return (
                   <th
                     key={col.key}
+                    scope="col"
+                    aria-sort={
+                      isActive
+                        ? sort.dir === 'asc'
+                          ? 'ascending'
+                          : 'descending'
+                        : sortable
+                          ? 'none'
+                          : undefined
+                    }
                     style={col.width ? { width: col.width } : undefined}
                     className={cn(
                       'text-2xs uppercase tracking-wider font-semibold text-text-muted',

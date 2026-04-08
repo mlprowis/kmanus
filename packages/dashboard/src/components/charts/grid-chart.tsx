@@ -291,11 +291,25 @@ export function GridChart({
     }
   }, [markPrice, entryPrice, liquidationPrice]);
 
+  // Build a screen-reader summary of the chart state. Lightweight Charts
+  // renders to a canvas which is opaque to assistive tech, so we expose
+  // the key facts as an aria-label.
+  const buyCount = levels.filter((l) => l.side === 'buy' && l.is_filled === 0).length;
+  const sellCount = levels.filter((l) => l.side === 'sell' && l.is_filled === 0).length;
+  const filledCount = levels.filter((l) => l.is_filled === 1).length;
+  const ariaLabel =
+    `Grid chart with ${candles.length} candles. ` +
+    `${levels.length} levels: ${buyCount} active buys, ${sellCount} active sells, ${filledCount} filled. ` +
+    (markPrice ? `Mark price ${markPrice.toFixed(2)}. ` : '') +
+    (entryPrice ? `Entry price ${entryPrice.toFixed(2)}.` : '');
+
   return (
     <div
       ref={containerRef}
       className={className}
       style={{ width: '100%', height: '100%', minHeight: 320 }}
+      role="img"
+      aria-label={ariaLabel}
     />
   );
 }

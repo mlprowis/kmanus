@@ -18,8 +18,16 @@ export function Sparkline({ data, height = 40 }: SparklineProps) {
   const stroke = isUp ? '#22C55E' : '#EF4444';
   const fillId = `spark-${isUp ? 'up' : 'down'}`;
 
+  const pctChange = first > 0 ? ((last - first) / first) * 100 : 0;
+  const direction = isUp ? 'up' : 'down';
+  const ariaLabel = `Equity sparkline ${direction} ${pctChange.toFixed(1)}% over ${data.length} snapshots`;
+
   return (
-    <div style={{ height, width: '100%' }}>
+    <div
+      style={{ height, width: '100%' }}
+      role="img"
+      aria-label={ariaLabel}
+    >
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={data} margin={{ top: 2, bottom: 2, left: 0, right: 0 }}>
           <defs>
