@@ -29,16 +29,46 @@ const PORT = process.env.DASHBOARD_PORT || 3848;
 async function initializeServices() {
   try {
     console.log('🔧 Inicializando servicios...');
-    
+
     // Initialize database
     await db.initialize();
-    
+
+    // Multi-tenant: bootstrap owner user (idempotent). Reads
+    // OWNER_EMAIL + OWNER_INITIAL_PASSWORD from env. If users
+    // table is empty, creates user 1 (admin) and backfills every
+    // existing per-bot row to user_id=1. Skips silently after
+    // the first run (any user already exists).
+    const ownerEmail = process.env.OWNER_EMAIL;
+    const ownerPassword = process.env.OWNER_INITIAL_PASSWORD;
+    if (ownerEmail && ownerPassword) {
+      try {
+        const { hashPassword } = await import('../auth/passwords.js');
+        const hash = await hashPassword(ownerPassword);
+        const result = await db.ownerBootstrap({
+          email: ownerEmail.toLowerCase().trim(),
+          password_hash: hash,
+        });
+        if (result.created) {
+          console.log(`👤 Owner user created: ${ownerEmail} (id=${result.userId})`);
+          console.log(`⚠️  REMOVE OWNER_INITIAL_PASSWORD from .env after first boot`);
+        } else {
+          console.log(`👤 Owner bootstrap skipped (users already exist; owner=${result.userId})`);
+        }
+      } catch (err) {
+        console.error('❌ Owner bootstrap failed:', err);
+        // Non-fatal: server keeps starting. Admin can manually
+        // create the owner via signup endpoint instead.
+      }
+    } else {
+      console.log('ℹ️  OWNER_EMAIL/OWNER_INITIAL_PASSWORD not set — skipping owner bootstrap');
+    }
+
     // ⚠️ FIX Bug 2: Auto-start grid engine monitoring
     await gridEngine.start();
     console.log('🤖 Grid Engine iniciado automáticamente');
-    
+
     console.log('✅ Servicios inicializados');
-    
+
   } catch (error) {
     console.error('❌ Error inicializando servicios:', error);
     process.exit(1);
@@ -1287,6 +1317,7 @@ async function startServer() {
         setRouter: setV2Router,
         httpServer,
         db: db.getRawDb(),
+        gridBotDb: db,
         grvtClient,
         engine: gridEngine,
         apiKey

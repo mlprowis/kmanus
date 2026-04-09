@@ -13,8 +13,21 @@
 
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import type Database from 'sqlite3';
+import { createHash } from 'node:crypto';
 import { childLogger } from './logger.js';
 import { cache } from './cache.js';
+import type { GridBotDB } from '../database/db.js';
+import { hashPassword, verifyPassword } from '../auth/passwords.js';
+import { signToken, verifyToken } from '../auth/jwt.js';
+import { encryptCredentialFields } from '../auth/crypto.js';
+
+// Augment Express Request to carry the authenticated user id set
+// by the JWT middleware. Every protected handler reads req.userId.
+declare module 'express-serve-static-core' {
+  interface Request {
+    userId?: number;
+  }
+}
 
 const log = childLogger('v2-router');
 
@@ -41,6 +54,7 @@ interface GrvtClient {
 // We don't import GridEngine directly to keep this layer free of cycles.
 interface EngineOps {
   createBot(config: {
+    userId: number;
     pair: string;
     direction: 'long' | 'short';
     leverage: number;
@@ -62,8 +76,12 @@ interface EngineOps {
 
 export interface V2RouterDeps {
   db: Database.Database;
+  // Multi-tenant: high-level wrapper for user/credential/terms CRUD.
+  gridBotDb: GridBotDB;
   grvtClient: GrvtClient;
   engineOps: EngineOps;
+  // Legacy single-tenant API key. Still accepted for backward compat
+  // (admin tools, scripts) but new clients should use JWT via /auth.
   apiKey: string;
 }
 
@@ -105,45 +123,325 @@ function dbRun(
 }
 
 // ─── Auth middleware ───────────────────────────────────────────────────
+// Multi-tenant: prefers JWT in Authorization header. Falls back to
+// the legacy X-Api-Key header (which assumes admin user_id=1) for
+// backward compatibility with scripts and the migration window.
+// Either way, sets req.userId so downstream handlers can scope.
 function makeAuthMiddleware(apiKey: string) {
   return (req: Request, res: Response, next: NextFunction) => {
-    const provided = req.header('x-api-key');
-    if (provided !== apiKey) {
-      log.warn({ ip: req.ip, path: req.path }, 'rejected unauthenticated v2 request');
-      return res.status(401).json({ error: 'unauthorized', hint: 'set X-Api-Key header' });
+    // Try JWT first.
+    const authHeader = req.header('authorization') || '';
+    const m = /^Bearer (.+)$/.exec(authHeader);
+    if (m) {
+      const payload = verifyToken(m[1]!);
+      if (payload) {
+        req.userId = payload.userId;
+        return next();
+      }
+      // Bearer present but invalid — fail fast, don't fall through.
+      log.warn({ ip: req.ip, path: req.path }, 'rejected v2 request: invalid/expired JWT');
+      return res.status(401).json({ error: 'invalid or expired token' });
     }
-    next();
-    return;
+
+    // Legacy API key fallback. Assumes admin owner = user 1.
+    const provided = req.header('x-api-key');
+    if (provided && provided === apiKey) {
+      req.userId = 1;
+      return next();
+    }
+
+    log.warn({ ip: req.ip, path: req.path }, 'rejected unauthenticated v2 request');
+    return res.status(401).json({
+      error: 'unauthorized',
+      hint: 'send Authorization: Bearer <jwt> or X-Api-Key (legacy)',
+    });
+  };
+}
+
+// Bot ownership guard. Throws (caught by asyncHandler) if the bot
+// doesn't exist or belongs to a different user. Returns the bot row
+// for downstream use so handlers don't have to re-fetch.
+async function requireBotOwnership(
+  db: Database.Database,
+  botId: number,
+  userId: number
+): Promise<{ id: number; user_id: number | null; pair: string; status: string }> {
+  const row = await dbGet<{ id: number; user_id: number | null; pair: string; status: string }>(
+    db,
+    `SELECT id, user_id, pair, status FROM grid_bots WHERE id = ?`,
+    [botId]
+  );
+  if (!row) {
+    const e = new Error('bot not found') as Error & { status?: number };
+    e.status = 404;
+    throw e;
+  }
+  // Legacy rows with NULL user_id are treated as owned by user 1
+  // (the owner) since the migration backfill targets user 1.
+  const ownerId = row.user_id ?? 1;
+  if (ownerId !== userId) {
+    const e = new Error('forbidden') as Error & { status?: number };
+    e.status = 403;
+    throw e;
+  }
+  return row;
+}
+
+// Admin guard for /admin/* endpoints. Reads is_admin from users.
+function makeAdminGuard(gridBotDb: GridBotDB) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    if (!req.userId) return res.status(401).json({ error: 'unauthorized' });
+    const u = await gridBotDb.getUserById(req.userId);
+    if (!u || !u.is_admin) {
+      return res.status(403).json({ error: 'admin required' });
+    }
+    return next();
   };
 }
 
 // ─── Error wrapper ─────────────────────────────────────────────────────
+// Catches thrown errors and converts them to clean JSON responses.
+// Errors with a numeric `status` property (e.g. from requireBotOwnership)
+// produce that status code; everything else is a 500.
 type AsyncHandler = (req: Request, res: Response) => Promise<unknown>;
 function asyncHandler(fn: AsyncHandler) {
   return (req: Request, res: Response, next: NextFunction) => {
-    Promise.resolve(fn(req, res)).catch(next);
+    Promise.resolve(fn(req, res)).catch((err: Error & { status?: number }) => {
+      if (res.headersSent) return next(err);
+      const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
+      res.status(status).json({
+        error: status === 500 ? 'internal_error' : err.message || 'request failed',
+        message: err.message,
+      });
+    });
   };
 }
 
 // ─── The router ────────────────────────────────────────────────────────
 export function createV2Router(deps: V2RouterDeps): Router {
-  const { db, grvtClient, engineOps, apiKey } = deps;
+  const { db, gridBotDb, grvtClient, engineOps, apiKey } = deps;
   const router = Router();
 
-  // All endpoints below require API key
+  // ─── Public auth endpoints (NO middleware) ──────────────────────
+  // Register these BEFORE the auth middleware so signup/login don't
+  // require a token. Order matters: anything declared after the
+  // router.use() below is protected.
+
+  // Hard-coded TOS shown at signup. Versioned so we can audit which
+  // version each user accepted. When you change the text, bump the
+  // version string AND update the corresponding terms_text in the
+  // dashboard signup form so the hash matches what was shown.
+  const SIGNUP_TOS_VERSION = '2026-04-09-v1';
+  const SIGNUP_TOS_TEXT = `By creating an account you confirm that:
+- This software trades real cryptocurrency on GRVT perpetual futures.
+- You can lose up to 100% of your invested capital. Leveraged trading carries significant risk.
+- The operator of this service is NOT a financial advisor, broker, or custodian. You are solely responsible for your trades.
+- The operator does NOT touch your funds. You provide your own GRVT API credentials and the bot trades on your sub-account.
+- No profit guarantees of any kind are made or implied.
+- The software is provided as-is, without warranty. Bugs, downtime, or exchange issues may cause losses.
+- You will not hold the operator liable for any losses.`;
+
+  // POST /api/v2/auth/signup — public.
+  router.post('/auth/signup', asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as { email?: unknown; password?: unknown };
+    const email = String(body.email ?? '').trim().toLowerCase();
+    const password = String(body.password ?? '');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'invalid email' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'password too short (min 8 chars)' });
+    }
+    const existing = await gridBotDb.getUserByEmail(email);
+    if (existing) {
+      return res.status(409).json({ error: 'email already registered' });
+    }
+    const password_hash = await hashPassword(password);
+    // First user becomes admin automatically.
+    const userCount = await gridBotDb.countUsers();
+    const userId = await gridBotDb.createUser({
+      email,
+      password_hash,
+      is_admin: userCount === 0,
+    });
+    const ipAddress =
+      (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ||
+      req.ip ||
+      null;
+    const userAgent = req.header('user-agent') || null;
+    await gridBotDb.insertTermsAcceptance({
+      user_id: userId,
+      context: 'signup',
+      context_ref: null,
+      ip_address: ipAddress,
+      user_agent: userAgent,
+      terms_version: SIGNUP_TOS_VERSION,
+      terms_text: SIGNUP_TOS_TEXT,
+      terms_text_hash: createHash('sha256').update(SIGNUP_TOS_TEXT).digest('hex'),
+    });
+    log.info({ userId, email, isAdmin: userCount === 0 }, 'user signed up');
+    res.json({
+      token: signToken(userId),
+      userId,
+      isAdmin: userCount === 0,
+      hasGrvtCreds: false,
+    });
+    return;
+  }));
+
+  // POST /api/v2/auth/login — public.
+  router.post('/auth/login', asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as { email?: unknown; password?: unknown };
+    const email = String(body.email ?? '').trim().toLowerCase();
+    const password = String(body.password ?? '');
+    const user = await gridBotDb.getUserByEmail(email);
+    if (!user) {
+      return res.status(401).json({ error: 'invalid email or password' });
+    }
+    const ok = await verifyPassword(password, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ error: 'invalid email or password' });
+    }
+    await gridBotDb.updateUserLastLogin(user.id);
+    const hasGrvtCreds = await gridBotDb.hasGrvtCredentials(user.id);
+    log.info({ userId: user.id, email }, 'user logged in');
+    res.json({
+      token: signToken(user.id),
+      userId: user.id,
+      isAdmin: !!user.is_admin,
+      hasGrvtCreds,
+    });
+    return;
+  }));
+
+  // GET /api/v2/auth/tos — public, lets the dashboard fetch the
+  // current TOS text + version so signup form shows the same string
+  // we'll hash on the server side.
+  router.get('/auth/tos', (_req, res) => {
+    res.json({ version: SIGNUP_TOS_VERSION, text: SIGNUP_TOS_TEXT });
+  });
+
+  // ─── Protected endpoints below this line ───────────────────────
+  // All endpoints below require either Bearer JWT (preferred) or
+  // legacy X-Api-Key header (admin/scripts).
   router.use(makeAuthMiddleware(apiKey));
+
+  // ── GET /api/v2/auth/me ────────────────────────────────────────
+  // Returns the authenticated user's profile + whether they have
+  // GRVT credentials configured (so the dashboard can decide if it
+  // should redirect to onboarding).
+  router.get('/auth/me', asyncHandler(async (req, res) => {
+    const userId = req.userId!;
+    const user = await gridBotDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'user not found' });
+    const hasGrvtCreds = await gridBotDb.hasGrvtCredentials(userId);
+    res.json({
+      id: user.id,
+      email: user.email,
+      isAdmin: !!user.is_admin,
+      hasGrvtCreds,
+      createdAt: user.created_at,
+      lastLoginAt: user.last_login_at,
+    });
+    return;
+  }));
+
+  // ── POST /api/v2/auth/grvt-credentials ─────────────────────────
+  // Save (or update) the user's GRVT credentials. Encrypts each
+  // field with AES-256-GCM before persisting. Does NOT test the
+  // connection here — Sprint 2 will add a per-user GRVTClient
+  // factory and a real test-connection step. For now we just
+  // accept and store.
+  router.post('/auth/grvt-credentials', asyncHandler(async (req, res) => {
+    const userId = req.userId!;
+    const body = (req.body ?? {}) as {
+      apiKey?: unknown;
+      apiSecret?: unknown;
+      tradingAddress?: unknown;
+      accountId?: unknown;
+      subAccountId?: unknown;
+    };
+    const apiKey = String(body.apiKey ?? '').trim();
+    const apiSecret = String(body.apiSecret ?? '').trim();
+    const tradingAddress = String(body.tradingAddress ?? '').trim();
+    const accountId = String(body.accountId ?? '').trim();
+    const subAccountId = String(body.subAccountId ?? '').trim();
+
+    const errors: string[] = [];
+    if (!apiKey) errors.push('apiKey is required');
+    if (!apiSecret) errors.push('apiSecret is required');
+    if (!/^0x[0-9a-fA-F]{64}$/.test(apiSecret)) {
+      errors.push('apiSecret must be a 0x-prefixed 32-byte hex string');
+    }
+    if (!tradingAddress || !/^0x[0-9a-fA-F]{40}$/.test(tradingAddress)) {
+      errors.push('tradingAddress must be a 0x-prefixed Ethereum address');
+    }
+    if (!accountId) errors.push('accountId is required');
+    if (!subAccountId) errors.push('subAccountId is required');
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'validation_failed', errors });
+    }
+
+    try {
+      const encrypted = encryptCredentialFields({
+        apiKey,
+        apiSecret,
+        tradingAddress,
+        accountId,
+        subAccountId,
+      });
+      await gridBotDb.upsertGrvtCredentials({
+        user_id: userId,
+        ...encrypted,
+        last_test_ok: false, // Sprint 2 will set this from a real test
+        last_test_error: null,
+      });
+      log.info({ userId }, 'GRVT credentials saved (not yet tested)');
+      res.json({ ok: true });
+    } catch (err) {
+      log.error({ userId, err: (err as Error).message }, 'failed to save GRVT credentials');
+      res.status(500).json({
+        error: 'save_failed',
+        message: (err as Error).message,
+      });
+    }
+    return;
+  }));
+
+  // ── DELETE /api/v2/auth/grvt-credentials ───────────────────────
+  // Refuses if the user has running or paused bots — they must be
+  // closed first to avoid orphaning bots without credentials.
+  router.delete('/auth/grvt-credentials', asyncHandler(async (req, res) => {
+    const userId = req.userId!;
+    const active = await gridBotDb.countActiveBotsForUser(userId);
+    if (active > 0) {
+      return res.status(409).json({
+        error: 'has_active_bots',
+        message: `Close all ${active} active bots before disconnecting GRVT credentials`,
+      });
+    }
+    await gridBotDb.deleteGrvtCredentials(userId);
+    log.info({ userId }, 'GRVT credentials deleted');
+    res.json({ ok: true });
+    return;
+  }));
 
   // ── GET /api/v2/bots ──────────────────────────────────────────────
   // List all bots with the fields the dashboard cares about.
-  router.get('/bots', asyncHandler(async (_req, res) => {
+  router.get('/bots', asyncHandler(async (req, res) => {
+    // Multi-tenant: list only the bots owned by this user. Legacy
+    // rows with NULL user_id are treated as user 1's so they keep
+    // showing up after the migration.
+    const userId = req.userId!;
     const rows = await dbAll(db, `
       SELECT id, pair, direction, leverage, lower_price, upper_price, num_grids,
              investment_usdt, grid_profit_usdt, trend_pnl_usdt, total_pnl_usdt,
              status, position_size, avg_entry_price, liquidation_price,
              created_at, updated_at
       FROM grid_bots
+      WHERE COALESCE(user_id, 1) = ?
       ORDER BY created_at DESC
-    `);
+    `, [userId]);
     res.json({ bots: rows });
     return;
   }));
@@ -152,6 +450,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     const bot = await dbGet(db, `SELECT * FROM grid_bots WHERE id = ?`, [id]);
     if (!bot) return res.status(404).json({ error: 'bot not found' });
     res.json({ bot });
@@ -165,6 +464,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/grid-state', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
 
     const bot = await dbGet<{ pair: string; status: string }>(
       db,
@@ -265,6 +565,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/trades', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     const limit = Math.min(parseInt((req.query.limit as string) ?? '100', 10) || 100, 1000);
     const trades = await dbAll(db, `
       SELECT id, side, quantity, price, fee, round_trip_profit, created_at
@@ -281,6 +582,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/snapshots', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     const snapshots = await dbAll(db, `
       SELECT * FROM daily_snapshots WHERE bot_id = ? ORDER BY date DESC LIMIT 365
     `, [id]);
@@ -291,18 +593,24 @@ export function createV2Router(deps: V2RouterDeps): Router {
   // ── GET /api/v2/bots/:id/roundtrips ───────────────────────────────
   // Used for the win-rate stat and the fills feed.
   router.get('/bots/:id/roundtrips', asyncHandler(async (req, res) => {
-    void parseInt(String(req.params.id ?? ''), 10);  // accept but ignore for v0
-    // paired_roundtrips doesn't have bot_id yet (Phase B migration). For now
-    // return all of them — we only have one bot anyway.
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
+    // Multi-tenant: filter by user_id (added in the migration). Legacy
+    // rows with NULL user_id are treated as user 1's.
+    const userId = req.userId!;
     const roundtrips = await dbAll(db, `
       SELECT id, buy_fill_id, sell_fill_id, buy_price, sell_price, size, profit, created_at
       FROM paired_roundtrips
+      WHERE COALESCE(user_id, 1) = ?
       ORDER BY id DESC
       LIMIT 1000
-    `);
+    `, [userId]);
     const total = await dbGet<{ c: number; sum: number }>(db, `
-      SELECT COUNT(*) as c, COALESCE(SUM(profit), 0) as sum FROM paired_roundtrips
-    `);
+      SELECT COUNT(*) as c, COALESCE(SUM(profit), 0) as sum
+      FROM paired_roundtrips
+      WHERE COALESCE(user_id, 1) = ?
+    `, [userId]);
     res.json({ roundtrips, count: total?.c ?? 0, totalProfit: total?.sum ?? 0 });
     return;
   }));
@@ -320,6 +628,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/fills', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     const limit = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 1000);
 
     const fills = await dbAll<{
@@ -356,6 +665,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/rebate-summary', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
 
     const row = await dbGet<{
       count: number;
@@ -412,6 +722,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/realized-summary', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
 
     // ── WHY THIS METHOD ────────────────────────────────────────────
     // For a grid bot, "realized PnL" is NOT computable from balance
@@ -555,6 +866,11 @@ export function createV2Router(deps: V2RouterDeps): Router {
   // grid_levels, the engine's monitor will not interfere because it
   // only manages levels (this is just a position adjustment).
   router.post('/admin/manual-trade', asyncHandler(async (req, res) => {
+    // Admin only.
+    const me = await gridBotDb.getUserById(req.userId!);
+    if (!me?.is_admin) {
+      return res.status(403).json({ error: 'admin required' });
+    }
     const body = (req.body ?? {}) as {
       botId?: unknown;
       side?: unknown;
@@ -658,6 +974,11 @@ export function createV2Router(deps: V2RouterDeps): Router {
   // Returns counts for the operator to verify how much new data was
   // recovered. Triggered manually via curl with X-Api-Key.
   router.post('/admin/backfill-fills', asyncHandler(async (req, res) => {
+    // Admin only.
+    const me = await gridBotDb.getUserById(req.userId!);
+    if (!me?.is_admin) {
+      return res.status(403).json({ error: 'admin required' });
+    }
     const botId = parseInt(String(req.query.botId ?? '0'), 10);
     if (!Number.isFinite(botId) || botId <= 0) {
       return res.status(400).json({ error: 'botId query param required' });
@@ -763,6 +1084,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/orders', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     const status = String(req.query.status ?? 'all');
     const limit = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 1000);
 
@@ -794,6 +1116,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.get('/bots/:id/funding', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     const limit = Math.min(parseInt(String(req.query.limit ?? '500'), 10) || 500, 5000);
 
     const funding = await dbAll(db, `
@@ -942,6 +1265,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
       num_grids: number;
       investment_usdt: number;
       leverage: number;
+      acceptedTermsText: string;
+      termsVersion: string;
     }>;
 
     const errors: string[] = [];
@@ -969,7 +1294,9 @@ export function createV2Router(deps: V2RouterDeps): Router {
     }
 
     try {
+      const userId = req.userId!;
       const botId = await engineOps.createBot({
+        userId,
         pair,
         direction,
         leverage,
@@ -978,7 +1305,31 @@ export function createV2Router(deps: V2RouterDeps): Router {
         numGrids: grids,
         investmentUSDT: investment,
       });
-      log.info({ botId, pair, direction, leverage, grids }, 'bot created (paused)');
+      log.info({ botId, userId, pair, direction, leverage, grids }, 'bot created (paused)');
+
+      // Persist per-bot risk acceptance if the dashboard sent the
+      // exact text + version it showed. The text is hashed and the
+      // request IP/UA are stored as audit trail.
+      const acceptedText = String(body.acceptedTermsText ?? '').trim();
+      const termsVersion = String(body.termsVersion ?? '').trim();
+      if (acceptedText && termsVersion) {
+        const ipAddress =
+          (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ||
+          req.ip ||
+          null;
+        const userAgent = req.header('user-agent') || null;
+        await gridBotDb.insertTermsAcceptance({
+          user_id: userId,
+          context: 'create_bot',
+          context_ref: botId,
+          ip_address: ipAddress,
+          user_agent: userAgent,
+          terms_version: termsVersion,
+          terms_text: acceptedText,
+          terms_text_hash: createHash('sha256').update(acceptedText).digest('hex'),
+        });
+      }
+
       // Invalidate the bots cache so the next /bots GET sees the new row.
       cache.invalidatePrefix('bots');
       res.status(201).json({ id: botId, status: 'paused' });
@@ -1000,6 +1351,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.post('/bots/:id/start', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     try {
       await engineOps.startBot(id);
       log.info({ botId: id }, 'bot started via API');
@@ -1023,6 +1375,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.post('/bots/:id/pause', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     try {
       await engineOps.pauseBot(id);
       log.info({ botId: id }, 'bot paused via API');
@@ -1050,6 +1403,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.post('/bots/:id/close', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
     try {
       await engineOps.closeBot(id);
       log.info({ botId: id }, 'bot closed via API');
@@ -1078,6 +1432,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.post('/bots/:id/range/preview', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
 
     const body = (req.body ?? {}) as { lowerPrice?: unknown; upperPrice?: unknown };
     const lowerPrice = parseFloat(String(body.lowerPrice ?? ''));
@@ -1124,6 +1479,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
   router.post('/bots/:id/range', asyncHandler(async (req, res) => {
     const id = parseInt(String(req.params.id ?? ''), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+    await requireBotOwnership(db, id, req.userId!);
 
     const body = (req.body ?? {}) as { lowerPrice?: unknown; upperPrice?: unknown };
     const lowerPrice = parseFloat(String(body.lowerPrice ?? ''));

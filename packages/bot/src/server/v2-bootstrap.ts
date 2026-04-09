@@ -18,6 +18,7 @@ import { GrvtWebSocketServer } from './ws-server.js';
 import { WsDispatcher } from './ws-dispatcher.js';
 import { createV2Router } from './v2-router.js';
 import { childLogger } from './logger.js';
+import type { GridBotDB } from '../database/db.js';
 
 const log = childLogger('v2-bootstrap');
 
@@ -67,6 +68,10 @@ export interface MountV2Options {
   setRouter: (router: Router) => void;
   httpServer: HttpServer;
   db: Database.Database;
+  // Higher-level wrapper around the same db. Exposes per-user CRUD
+  // (createUser, upsertGrvtCredentials, getBotsForUser, etc) that
+  // the multi-tenant auth endpoints depend on. Required.
+  gridBotDb: GridBotDB;
   grvtClient: GrvtClient;
   // The full engine — used as an EventEmitter for the dispatcher AND as
   // the source of mutation ops (createBot/startBot/pauseBot) for the
@@ -90,6 +95,7 @@ export function mountV2(opts: MountV2Options): V2Handles {
   // is what makes this work.
   const router = createV2Router({
     db: opts.db,
+    gridBotDb: opts.gridBotDb,
     grvtClient: opts.grvtClient,
     engineOps: opts.engine,
     apiKey: opts.apiKey

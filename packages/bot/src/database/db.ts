@@ -12,6 +12,10 @@ const Database = process.env.NODE_ENV === 'production' ? sqlite3.Database : sqli
 
 export interface GridBot {
   id: number;
+  // Multi-tenant: which user owns this bot. Required for all new
+  // bots; nullable on the type for backward compat with rows from
+  // before the migration (those get backfilled by ownerBootstrap).
+  user_id?: number;
   pair: string;
   direction: 'long' | 'short';
   leverage: number;
@@ -451,7 +455,160 @@ export class GridBotDB {
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_funding_bot_id ON funding_history(bot_id)`);
 
+    // ─── Multi-tenancy migration ────────────────────────────────────
+    // Adds users + grvt_credentials + terms_acceptances + user_id on
+    // every per-bot table. Idempotent: each ALTER is wrapped in
+    // try/catch since SQLite has no `IF NOT EXISTS` for ALTER.
+    // See plan: C:\Users\52553\.claude\plans\virtual-splashing-ocean.md
+    await this.runMultitenantMigration();
+
     console.log('📋 Tablas creadas/verificadas');
+  }
+
+  private async runMultitenantMigration(): Promise<void> {
+    // Schema version tracking — first applied = 1.
+    await this.dbRun(`
+      CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER PRIMARY KEY,
+        applied_at INTEGER NOT NULL
+      )
+    `);
+
+    // users — one row per account. Owner is user_id=1, created via
+    // owner bootstrap (see initialize()).
+    await this.dbRun(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        email_verified INTEGER NOT NULL DEFAULT 0,
+        is_admin INTEGER NOT NULL DEFAULT 0,
+        accepted_referral_link INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        last_login_at INTEGER
+      )
+    `);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
+
+    // grvt_credentials — AES-256-GCM encrypted GRVT API + signing
+    // material. One row per user. Each field has its own IV+tag
+    // because GCM requires unique IV per ciphertext under same key.
+    // Master key lives at MASTER_KEY_PATH on disk; losing it means
+    // every user must re-paste their credentials.
+    await this.dbRun(`
+      CREATE TABLE IF NOT EXISTS grvt_credentials (
+        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        encrypted_api_key TEXT NOT NULL,
+        api_key_iv TEXT NOT NULL,
+        api_key_tag TEXT NOT NULL,
+        encrypted_api_secret TEXT NOT NULL,
+        api_secret_iv TEXT NOT NULL,
+        api_secret_tag TEXT NOT NULL,
+        encrypted_trading_address TEXT NOT NULL,
+        trading_address_iv TEXT NOT NULL,
+        trading_address_tag TEXT NOT NULL,
+        encrypted_account_id TEXT NOT NULL,
+        account_id_iv TEXT NOT NULL,
+        account_id_tag TEXT NOT NULL,
+        encrypted_sub_account_id TEXT NOT NULL,
+        sub_account_id_iv TEXT NOT NULL,
+        sub_account_id_tag TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        last_test_ok INTEGER,
+        last_test_at INTEGER,
+        last_test_error TEXT
+      )
+    `);
+
+    // terms_acceptances — append-only audit log. Stores the EXACT
+    // text shown to the user at the moment of acceptance, plus IP
+    // and user agent, so we can prove what they saw if anything is
+    // ever disputed. context distinguishes signup TOS from per-bot
+    // risk acceptance.
+    await this.dbRun(`
+      CREATE TABLE IF NOT EXISTS terms_acceptances (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        context TEXT NOT NULL,
+        context_ref INTEGER,
+        accepted_at INTEGER NOT NULL,
+        ip_address TEXT,
+        user_agent TEXT,
+        terms_version TEXT NOT NULL,
+        terms_text_hash TEXT NOT NULL,
+        terms_text TEXT NOT NULL
+      )
+    `);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_terms_user ON terms_acceptances(user_id)`);
+
+    // ALTER existing tables to add user_id. Wrapped in try/catch
+    // because SQLite doesn't support `ADD COLUMN IF NOT EXISTS`.
+    // The columns are nullable; backfill happens in ownerBootstrap().
+    const tablesToAlter = [
+      'grid_bots',
+      'grid_levels',
+      'orders',
+      'trades',
+      'funding_history',
+      'daily_snapshots',
+      'fills_archive',
+      'bot_cash_movements',
+      'paired_roundtrips',
+    ];
+    for (const table of tablesToAlter) {
+      try {
+        await this.dbRun(`ALTER TABLE ${table} ADD COLUMN user_id INTEGER REFERENCES users(id)`);
+        console.log(`✅ Columna user_id agregada a ${table}`);
+      } catch (e) {
+        // Already exists, ignore.
+      }
+    }
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_grid_bots_user ON grid_bots(user_id)`);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)`);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_trades_user ON trades(user_id)`);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_fills_arch_user ON fills_archive(user_id)`);
+
+    // ─── Triggers: auto-fill user_id on child rows ────────────────
+    // Strategy: instead of refactoring every existing createX() to
+    // accept and propagate user_id, we let SQLite derive it from the
+    // parent grid_bots row at insert time. This keeps the blast
+    // radius small (only grid_bots.createBot() needs to know about
+    // user_id at the application level) and guarantees consistency
+    // — there's no way to forget to set user_id on a child row.
+    //
+    // Each trigger fires AFTER INSERT and updates the just-inserted
+    // row's user_id from the parent. Idempotent: DROP+CREATE.
+    const childTables: Array<{ table: string; parentJoin: string }> = [
+      { table: 'grid_levels',        parentJoin: 'NEW.bot_id' },
+      { table: 'orders',             parentJoin: 'NEW.bot_id' },
+      { table: 'trades',             parentJoin: 'NEW.bot_id' },
+      { table: 'funding_history',    parentJoin: 'NEW.bot_id' },
+      { table: 'daily_snapshots',    parentJoin: 'NEW.bot_id' },
+      { table: 'bot_cash_movements', parentJoin: 'NEW.bot_id' },
+      { table: 'fills_archive',      parentJoin: 'NEW.bot_id' },
+    ];
+    for (const { table, parentJoin } of childTables) {
+      const triggerName = `trg_${table}_user_id`;
+      await this.dbRun(`DROP TRIGGER IF EXISTS ${triggerName}`);
+      await this.dbRun(`
+        CREATE TRIGGER ${triggerName}
+        AFTER INSERT ON ${table}
+        FOR EACH ROW
+        WHEN NEW.user_id IS NULL AND ${parentJoin} IS NOT NULL
+        BEGIN
+          UPDATE ${table}
+          SET user_id = (SELECT user_id FROM grid_bots WHERE id = ${parentJoin})
+          WHERE rowid = NEW.rowid;
+        END
+      `);
+    }
+
+    // Stamp version 1 (idempotent).
+    await this.dbRun(`
+      INSERT OR IGNORE INTO schema_version (version, applied_at)
+      VALUES (1, ?)
+    `, [Date.now()]);
   }
 
   // === CRUD para grid_bots ===
@@ -475,10 +632,21 @@ export class GridBotDB {
     // formula above when params.quantity_per_level is not provided.
     const quantityPerLevel = params.quantity_per_level ?? computedQty;
 
+    // Multi-tenant: user_id is required for all new bots. Owners that
+    // upgraded from single-tenant get backfilled to user_id=1 by the
+    // owner bootstrap; the application is expected to always pass it
+    // explicitly going forward. We accept undefined here only as a
+    // transition affordance and let the trigger backfill from the
+    // parent (which won't happen if it's null on the parent itself).
+    if (params.user_id == null) {
+      console.warn(`⚠️  createBot called without user_id — this should only happen during legacy migration`);
+    }
+
     // Set original_investment_usdt = investment_usdt at creation. After
     // this point, investment_usdt may drift (compound, manual edits) but
     // the original is immutable so we always know the real cash deposit.
     const values = [
+      params.user_id ?? null,
       params.pair, params.direction, params.leverage, params.lower_price,
       params.upper_price, params.num_grids, params.investment_usdt,
       params.investment_usdt,  // original_investment_usdt = investment_usdt
@@ -489,11 +657,12 @@ export class GridBotDB {
     ];
     const sql = `
       INSERT INTO grid_bots (
+        user_id,
         pair, direction, leverage, lower_price, upper_price, num_grids,
         investment_usdt, original_investment_usdt, quantity_per_level,
         grid_profit_usdt, trend_pnl_usdt, total_pnl_usdt,
         status, position_size, avg_entry_price, liquidation_price, params_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     await this.dbRun(sql, values);
@@ -1308,6 +1477,223 @@ export class GridBotDB {
       totalPnl: pnlSum.total,
       totalTrades: tradesCount.count
     };
+  }
+
+  // ─── Multi-tenant: users ───────────────────────────────────────
+
+  async createUser(params: {
+    email: string;
+    password_hash: string;
+    is_admin?: boolean;
+  }): Promise<number> {
+    const result = await this.dbRun(
+      `INSERT INTO users (email, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)`,
+      [params.email, params.password_hash, params.is_admin ? 1 : 0, Date.now()]
+    );
+    return result.lastID ?? 0;
+  }
+
+  async getUserByEmail(email: string): Promise<{
+    id: number;
+    email: string;
+    password_hash: string;
+    is_admin: number;
+    created_at: number;
+    last_login_at: number | null;
+  } | null> {
+    return await this.dbGet(`SELECT * FROM users WHERE email = ?`, [email]);
+  }
+
+  async getUserById(id: number): Promise<{
+    id: number;
+    email: string;
+    password_hash: string;
+    is_admin: number;
+    created_at: number;
+    last_login_at: number | null;
+  } | null> {
+    return await this.dbGet(`SELECT * FROM users WHERE id = ?`, [id]);
+  }
+
+  async updateUserLastLogin(userId: number): Promise<void> {
+    await this.dbRun(
+      `UPDATE users SET last_login_at = ? WHERE id = ?`,
+      [Date.now(), userId]
+    );
+  }
+
+  async countUsers(): Promise<number> {
+    const row = await this.dbGet(`SELECT COUNT(*) as c FROM users`);
+    return (row?.c as number) ?? 0;
+  }
+
+  // ─── Multi-tenant: terms acceptances ───────────────────────────
+
+  async insertTermsAcceptance(params: {
+    user_id: number;
+    context: 'signup' | 'create_bot' | 'update_credentials';
+    context_ref?: number | null;
+    ip_address: string | null;
+    user_agent: string | null;
+    terms_version: string;
+    terms_text: string;
+    terms_text_hash: string;
+  }): Promise<void> {
+    await this.dbRun(
+      `INSERT INTO terms_acceptances
+        (user_id, context, context_ref, accepted_at, ip_address, user_agent, terms_version, terms_text_hash, terms_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        params.user_id,
+        params.context,
+        params.context_ref ?? null,
+        Date.now(),
+        params.ip_address,
+        params.user_agent,
+        params.terms_version,
+        params.terms_text_hash,
+        params.terms_text,
+      ]
+    );
+  }
+
+  // ─── Multi-tenant: grvt_credentials ────────────────────────────
+  // Stores AES-256-GCM encrypted credential fields. Each field has
+  // its own IV and auth tag. Reads return the raw encrypted blob;
+  // decryption happens in the api/grvt-client-factory layer.
+
+  async upsertGrvtCredentials(params: {
+    user_id: number;
+    encrypted_api_key: string;        api_key_iv: string;        api_key_tag: string;
+    encrypted_api_secret: string;     api_secret_iv: string;     api_secret_tag: string;
+    encrypted_trading_address: string;trading_address_iv: string;trading_address_tag: string;
+    encrypted_account_id: string;     account_id_iv: string;     account_id_tag: string;
+    encrypted_sub_account_id: string; sub_account_id_iv: string; sub_account_id_tag: string;
+    last_test_ok: boolean;
+    last_test_error?: string | null;
+  }): Promise<void> {
+    const now = Date.now();
+    await this.dbRun(
+      `INSERT INTO grvt_credentials (
+        user_id,
+        encrypted_api_key, api_key_iv, api_key_tag,
+        encrypted_api_secret, api_secret_iv, api_secret_tag,
+        encrypted_trading_address, trading_address_iv, trading_address_tag,
+        encrypted_account_id, account_id_iv, account_id_tag,
+        encrypted_sub_account_id, sub_account_id_iv, sub_account_id_tag,
+        created_at, last_test_ok, last_test_at, last_test_error
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        encrypted_api_key = excluded.encrypted_api_key,
+        api_key_iv = excluded.api_key_iv,
+        api_key_tag = excluded.api_key_tag,
+        encrypted_api_secret = excluded.encrypted_api_secret,
+        api_secret_iv = excluded.api_secret_iv,
+        api_secret_tag = excluded.api_secret_tag,
+        encrypted_trading_address = excluded.encrypted_trading_address,
+        trading_address_iv = excluded.trading_address_iv,
+        trading_address_tag = excluded.trading_address_tag,
+        encrypted_account_id = excluded.encrypted_account_id,
+        account_id_iv = excluded.account_id_iv,
+        account_id_tag = excluded.account_id_tag,
+        encrypted_sub_account_id = excluded.encrypted_sub_account_id,
+        sub_account_id_iv = excluded.sub_account_id_iv,
+        sub_account_id_tag = excluded.sub_account_id_tag,
+        last_test_ok = excluded.last_test_ok,
+        last_test_at = excluded.last_test_at,
+        last_test_error = excluded.last_test_error
+      `,
+      [
+        params.user_id,
+        params.encrypted_api_key, params.api_key_iv, params.api_key_tag,
+        params.encrypted_api_secret, params.api_secret_iv, params.api_secret_tag,
+        params.encrypted_trading_address, params.trading_address_iv, params.trading_address_tag,
+        params.encrypted_account_id, params.account_id_iv, params.account_id_tag,
+        params.encrypted_sub_account_id, params.sub_account_id_iv, params.sub_account_id_tag,
+        now, params.last_test_ok ? 1 : 0, now, params.last_test_error ?? null,
+      ]
+    );
+  }
+
+  async getGrvtCredentialsRaw(userId: number): Promise<{
+    user_id: number;
+    encrypted_api_key: string;        api_key_iv: string;        api_key_tag: string;
+    encrypted_api_secret: string;     api_secret_iv: string;     api_secret_tag: string;
+    encrypted_trading_address: string;trading_address_iv: string;trading_address_tag: string;
+    encrypted_account_id: string;     account_id_iv: string;     account_id_tag: string;
+    encrypted_sub_account_id: string; sub_account_id_iv: string; sub_account_id_tag: string;
+    created_at: number;
+    last_used_at: number | null;
+    last_test_ok: number | null;
+    last_test_at: number | null;
+    last_test_error: string | null;
+  } | null> {
+    return await this.dbGet(`SELECT * FROM grvt_credentials WHERE user_id = ?`, [userId]);
+  }
+
+  async hasGrvtCredentials(userId: number): Promise<boolean> {
+    const row = await this.dbGet(`SELECT 1 FROM grvt_credentials WHERE user_id = ?`, [userId]);
+    return !!row;
+  }
+
+  async deleteGrvtCredentials(userId: number): Promise<void> {
+    await this.dbRun(`DELETE FROM grvt_credentials WHERE user_id = ?`, [userId]);
+  }
+
+  async touchGrvtCredentialsLastUsed(userId: number): Promise<void> {
+    await this.dbRun(
+      `UPDATE grvt_credentials SET last_used_at = ? WHERE user_id = ?`,
+      [Date.now(), userId]
+    );
+  }
+
+  // ─── Multi-tenant: bot listing per user ────────────────────────
+
+  async getBotsForUser(userId: number): Promise<GridBot[]> {
+    return await this.dbAll(
+      `SELECT * FROM grid_bots WHERE user_id = ? ORDER BY created_at DESC`,
+      [userId]
+    );
+  }
+
+  async countActiveBotsForUser(userId: number): Promise<number> {
+    const row = await this.dbGet(
+      `SELECT COUNT(*) as c FROM grid_bots WHERE user_id = ? AND status IN ('running', 'paused')`,
+      [userId]
+    );
+    return (row?.c as number) ?? 0;
+  }
+
+  // ─── Owner bootstrap ───────────────────────────────────────────
+  // Idempotent. If users table is empty, creates user 1 from
+  // OWNER_EMAIL + OWNER_INITIAL_PASSWORD env vars and backfills
+  // every existing per-bot row to user_id=1. Skips silently if
+  // any user already exists.
+  async ownerBootstrap(params: {
+    email: string;
+    password_hash: string;
+  }): Promise<{ created: boolean; userId: number }> {
+    const existing = await this.countUsers();
+    if (existing > 0) {
+      const owner = await this.dbGet(`SELECT id FROM users ORDER BY id ASC LIMIT 1`);
+      return { created: false, userId: owner?.id ?? 1 };
+    }
+    const userId = await this.createUser({
+      email: params.email,
+      password_hash: params.password_hash,
+      is_admin: true,
+    });
+    // Backfill every per-bot row to this owner.
+    const tables = [
+      'grid_bots', 'grid_levels', 'orders', 'trades',
+      'funding_history', 'daily_snapshots', 'fills_archive',
+      'bot_cash_movements', 'paired_roundtrips',
+    ];
+    for (const t of tables) {
+      await this.dbRun(`UPDATE ${t} SET user_id = ? WHERE user_id IS NULL`, [userId]);
+    }
+    console.log(`👤 Owner bootstrap: user ${userId} (${params.email}) created and backfilled`);
+    return { created: true, userId };
   }
 
   /**

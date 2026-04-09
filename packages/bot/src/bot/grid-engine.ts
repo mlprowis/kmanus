@@ -7,6 +7,11 @@ import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
 import { EventEmitter } from 'events';
 
 export interface GridConfig {
+  // Multi-tenant: which user owns this bot. Required for new bots
+  // created via the API; optional in the type so legacy callers
+  // (admin scripts, tests) can omit it and the bot defaults to
+  // user 1 (the owner).
+  userId?: number;
   pair: string;
   direction: 'long' | 'short';
   leverage: number;
@@ -255,6 +260,9 @@ export class GridEngine extends EventEmitter {
       // another, causing position drift. The fix here ensures there is
       // exactly one source of truth: calculation.quantityPerGrid.
       const botId = await db.createBot({
+        // Default to user 1 (owner) when caller omits — admin
+        // scripts and legacy code paths get the right behavior.
+        user_id: config.userId ?? 1,
         pair: config.pair,
         direction: config.direction,
         leverage: config.leverage,
