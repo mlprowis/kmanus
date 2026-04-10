@@ -2625,26 +2625,27 @@ export class GridBotInstance {
    * Configurar daily snapshots para ejecutar cada 24h a las 00:00 UTC
    */
   private setupDailySnapshots(): void {
-    // Calcular tiempo hasta las próximas 00:00 UTC
+    // Take a snapshot on boot if there isn't one for today yet.
+    // This fixes the issue where repeated restarts reset the midnight
+    // timer and no snapshot ever gets created.
+    setTimeout(() => {
+      this.createDailySnapshots().catch(console.error);
+    }, 10_000); // 10s after boot (let auth + first monitor pass complete)
+
+    // Schedule next at midnight UTC, then every 24h
     const now = new Date();
     const tomorrow = new Date(now);
     tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
     tomorrow.setUTCHours(0, 0, 0, 0);
-    
     const msUntilMidnight = tomorrow.getTime() - now.getTime();
-    
-    console.log(`📸 Daily snapshots configurados - próximo en ${Math.round(msUntilMidnight / 1000 / 3600)} horas`);
-    
-    // Configurar timeout para la primera ejecución (a medianoche)
+
+    console.log(`📸 Daily snapshots: boot snapshot in 10s, then midnight UTC (${Math.round(msUntilMidnight / 1000 / 3600)}h)`);
+
     setTimeout(() => {
-      // Crear snapshot inmediatamente a medianoche
       this.createDailySnapshots().catch(console.error);
-      
-      // Luego configurar interval cada 24h
       (this as any).dailySnapshotInterval = setInterval(() => {
         this.createDailySnapshots().catch(console.error);
-      }, 24 * 60 * 60 * 1000); // 24 horas
-      
+      }, 24 * 60 * 60 * 1000);
     }, msUntilMidnight);
   }
 
