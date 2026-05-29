@@ -1,0 +1,19 @@
+[phases.setup]
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "sh -c 'mkdir -p /etc/grvt-grid && printf \"%b\" \"$(echo $MASTER_KEY_HEX | fold -w2 | while read c; do printf \"\\\\x$c\"; done)\" > /etc/grvt-grid/master.key && node packages/bot/dist/dashboard/server.js'"
+{
+  "deploy": {
+    "healthcheckPath": "/api/health",
+    "healthcheckTimeout": 300,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}
