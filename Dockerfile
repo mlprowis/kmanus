@@ -27,4 +27,4 @@ COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 EXPOSE 3848
-CMD ["sh", "/app/start.sh"]
+CMD ["/bin/sh", "-c", "node -e \"require('fs').mkdirSync('/etc/grvt-grid',{recursive:true});require('fs').writeFileSync('/etc/grvt-grid/master.key',Buffer.from(process.env.MASTER_KEY_HEX,'hex'))\" && node packages/bot/dist/dashboard/server.js"]
