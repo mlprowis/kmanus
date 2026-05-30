@@ -13,4 +13,4 @@ cmds = [
 ]
 
 [start]
-cmd = "node run.js"
+cmd = "npm run start --workspace=@grvt-grid/bot"
