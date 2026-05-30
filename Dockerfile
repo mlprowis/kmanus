@@ -17,10 +17,10 @@ RUN npm run build --workspace=@grvt-grid/bot
 # Compilar dashboard
 RUN cd packages/dashboard && npx vite build
 
-# Copiar dashboard al bot
-RUN mkdir -p packages/bot/dist/dashboard/public && \
-    cp -r packages/dashboard/dist/. packages/bot/dist/dashboard/public/
-
+# Copiar dashboard a la ruta que busca el servidor
+RUN mkdir -p /opt/grvt-grid-bot/dashboard-dist && \
+    cp -r packages/dashboard/dist/. /opt/grvt-grid-bot/dashboard-dist/
+    
 EXPOSE 3848
 
 CMD ["npm", "run", "start", "--workspace=@grvt-grid/bot"]
