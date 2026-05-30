@@ -1,6 +1,6 @@
 {
   "deploy": {
-    "startCommand": "sh -c 'echo STEP1 && node --version && echo STEP2 && ls /app/packages/bot/dist/dashboard/ && echo STEP3'",
+    "startCommand": "node -e \"require('http').createServer((req,res)=>{res.end('ALIVE')}).listen(3848,function(){console.log('SERVER_OK_ON_3848')})\"",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
   }
