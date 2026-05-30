@@ -1,1 +1,0 @@
-sh /app/start.sh
