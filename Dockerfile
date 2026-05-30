@@ -1,20 +1,15 @@
-FROM ubuntu:24.04
+FROM node:22-bookworm-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y curl python3 make g++ && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y nodejs && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
 COPY packages/bot/package.json ./packages/bot/
 COPY packages/dashboard/package.json ./packages/dashboard/
 COPY packages/notifier/package.json ./packages/notifier/
 
-RUN npm ci
-RUN npm_config_build_from_source=true npm rebuild sqlite3
+RUN npm_config_build_from_source=true npm ci
 
 COPY . .
 
@@ -23,8 +18,6 @@ RUN npm run build --workspace=@grvt-grid/bot && \
     mkdir -p /app/packages/bot/dist/dashboard/public && \
     cp -r /app/packages/dashboard/dist/. /app/packages/bot/dist/dashboard/public/
 
-COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
-
 EXPOSE 3848
-CMD ["/bin/sh", "-c", "node -e \"require('fs').mkdirSync('/etc/grvt-grid',{recursive:true});require('fs').writeFileSync('/etc/grvt-grid/master.key',Buffer.from(process.env.MASTER_KEY_HEX,'hex'))\" && node packages/bot/dist/dashboard/server.js"]
+
+CMD ["node", "run.js"]
