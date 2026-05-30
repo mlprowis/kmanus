@@ -1,0 +1,16 @@
+[phases.setup]
+nixPkgs = ["nodejs_22", "python3", "gnumake", "gcc"]
+
+[phases.install]
+cmds = ["npm_config_build_from_source=true npm ci"]
+
+[phases.build]
+cmds = [
+  "npm run build --workspace=@grvt-grid/bot",
+  "cd packages/dashboard && npx vite build",
+  "mkdir -p packages/bot/dist/dashboard/public",
+  "cp -r packages/dashboard/dist/. packages/bot/dist/dashboard/public/"
+]
+
+[start]
+cmd = "node run.js"
