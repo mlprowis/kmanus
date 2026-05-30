@@ -1,0 +1,7 @@
+"scripts": {
+  "prestart": "node ../../run.js",
+  "dev": "tsx watch src/dashboard/server.ts",
+  "build": "tsc",
+  "start": "node dist/dashboard/server.js",
+  ...
+}
