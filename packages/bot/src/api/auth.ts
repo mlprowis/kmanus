@@ -303,14 +303,24 @@ export async function authenticateWithKey(
       },
       body: JSON.stringify({ api_key: apiKey }),
     });
-    if (!response.ok) return false;
-    const setCookie = response.headers.get('set-cookie');
-    const accountId = response.headers.get('x-grvt-account-id');
-    if (!setCookie || !accountId) return false;
+        if (!response.ok) return false;
+    
+    // GRVT devuelve status y sub_account_id en el body
+    const body = await response.json() as any;
+    if (body.status !== 'success') return false;
+    
+    // Account ID: primero header, si no del body
+    const accountId = response.headers.get('x-grvt-account-id') || 
+                      String(body.sub_account_id || '');
+    if (!accountId) return false;
+    
+    // Cookie de sesión (puede venir en header)
+    const setCookie = response.headers.get('set-cookie') || '';
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
-    if (!gravityMatch?.[1]) return false;
+    const gravityCookie = gravityMatch?.[1] || '';
+    
     const now = Date.now();
-    state.gravityCookie = gravityMatch[1];
+    state.gravityCookie = gravityCookie;
     state.accountId = accountId;
     state.isAuthenticated = true;
     state.expiresAt = now + 23 * 60 * 60 * 1000;
