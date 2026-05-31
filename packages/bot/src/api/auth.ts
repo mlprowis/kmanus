@@ -1,7 +1,3 @@
-// GRVT Authentication Module - Fase 3
-// Auth via edge.grvt.io con cookie-based auth + IPv4 forzado
-// Implementado según specs verificadas por Marta
-
 import dns from 'dns';
 import http from 'http';
 import https from 'https';
@@ -10,18 +6,14 @@ import { Agent, fetch as undiciFetch } from 'undici';
 
 dotenv.config();
 
-// 🚨 CRÍTICO: Forzar IPv4 globalmente 
 dns.setDefaultResultOrder('ipv4first');
 
-// Agente HTTP con IPv4 forzado (para undici)
 const ipv4Agent = new Agent({ connect: { family: 4 } });
 
-// Override global fetch with undici (supports agent option properly)
 const fetchIPv4 = (url: string, init?: any): Promise<Response> => {
   return undiciFetch(url, { ...init, dispatcher: ipv4Agent }) as unknown as Promise<Response>;
 };
 
-// Legacy agents (keep for compatibility)
 const httpAgent = new http.Agent({ family: 4 });
 const httpsAgent = new https.Agent({ family: 4 });
 
@@ -43,15 +35,8 @@ export function createEmptyAuthState(): AuthState {
   };
 }
 
-// Legacy global auth state — used by the singleton GRVTClient path
-// (env-based creds). Multi-tenant clients have their own AuthState.
 let authState: AuthState = createEmptyAuthState();
 
-/**
- * Login a GRVT usando API key - flow verificado por Marta
- * POST https://edge.grvt.io/auth/api_key/login
- * Response: Set-Cookie: gravity=XXX + X-Grvt-Account-Id: XXX
- */
 export async function authenticateGRVT(): Promise<boolean> {
   try {
     console.log('🔐 Autenticando con GRVT Edge API...');
@@ -61,40 +46,50 @@ export async function authenticateGRVT(): Promise<boolean> {
       throw new Error('GRVT_API_KEY no encontrada en .env');
     }
 
-    // Login request con IPv4 agent
     const response = await fetchIPv4('https://edge.grvt.io/auth/api_key/login', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': 'GRVT-Grid-Bot/1.0'
       },
-      body: JSON.stringify({
-        api_key: apiKey
-      }),
+      body: JSON.stringify({ api_key: apiKey }),
     });
 
     console.log(`📡 Login response: ${response.status}`);
 
-    if (!response.ok) return false;
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('❌ Login failed:', errorText);
+      return false;
+    }
+
     const body = await response.json() as any;
-    if (body.status !== 'success') return false;
+    if (body.status !== 'success') {
+      console.error('❌ Login status not success:', body);
+      return false;
+    }
+
     const accountId = response.headers.get('x-grvt-account-id') || String(body.sub_account_id || '');
-    if (!accountId) return false;
+    if (!accountId) {
+      console.error('❌ No account ID found');
+      return false;
+    }
+
     const setCookie = response.headers.get('set-cookie') || '';
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
     const gravityCookie = gravityMatch?.[1] || '';
+
     const now = Date.now();
-    state.gravityCookie = gravityCookie;
-    state.accountId = accountId;
+    authState = {
+      gravityCookie,
+      accountId,
       isAuthenticated: true,
-      expiresAt: now + (23 * 60 * 60 * 1000), // Expira en 23h (safety margin)
+      expiresAt: now + (23 * 60 * 60 * 1000),
       loginTime: now
     };
 
     console.log('✅ Auth exitoso!');
     console.log(`🆔 Account ID: ${accountId}`);
-    console.log(`🍪 Cookie expires in: ${Math.floor((authState.expiresAt - now) / 1000 / 3600)}h`);
-    
     return true;
 
   } catch (error) {
@@ -104,27 +99,17 @@ export async function authenticateGRVT(): Promise<boolean> {
   }
 }
 
-/**
- * Verificar si necesitamos re-autenticar
- */
 function needsReauth(): boolean {
   if (!authState.isAuthenticated) return true;
-  
   const now = Date.now();
   const timeLeft = authState.expiresAt - now;
-  
-  // Re-auth si quedan menos de 1 hora
   if (timeLeft < 60 * 60 * 1000) {
     console.log('⏰ Cookie expirando pronto, re-autenticando...');
     return true;
   }
-  
   return false;
 }
 
-/**
- * Asegurar que estamos autenticados
- */
 async function ensureAuthenticated(): Promise<void> {
   if (needsReauth()) {
     const success = await authenticateGRVT();
@@ -134,16 +119,10 @@ async function ensureAuthenticated(): Promise<void> {
   }
 }
 
-/**
- * Realizar request autenticado a GRVT APIs
- */
 export async function authenticatedRequest(
   url: string, 
   body: object = {}, 
-  options: {
-    method?: string;
-    timeout?: number;
-  } = {}
+  options: { method?: string; timeout?: number; } = {}
 ): Promise<any> {
   await ensureAuthenticated();
   
@@ -157,10 +136,6 @@ export async function authenticatedRequest(
   };
   
   try {
-    // Debug: log request details
-    if (url.includes('open_orders')) {
-      console.log(`🔍 DEBUG open_orders - Cookie: ${authState.gravityCookie.substring(0, 20)}... AccountId: ${authState.accountId} Body: ${JSON.stringify(body)}`);
-    }
     const response = await fetchIPv4(url, {
       method,
       headers,
@@ -171,12 +146,9 @@ export async function authenticatedRequest(
     console.log(`📡 ${method} ${url} → ${response.status}`);
 
     if (response.status === 401) {
-      // Token expirado, invalidar y reintentar
       console.log('🔒 Token expirado, reautenticando...');
       authState.isAuthenticated = false;
       await ensureAuthenticated();
-      
-      // Retry con nuevo token
       return await authenticatedRequest(url, body, options);
     }
 
@@ -196,9 +168,6 @@ export async function authenticatedRequest(
   }
 }
 
-/**
- * Request público a Market Data API (sin auth)
- */
 export async function publicRequest(
   url: string,
   body: object = {},
@@ -235,13 +204,9 @@ export async function publicRequest(
   }
 }
 
-/**
- * Obtener estado de autenticación
- */
 export function getAuthStatus() {
   const now = Date.now();
   const timeLeft = authState.expiresAt - now;
-  
   return {
     isAuthenticated: authState.isAuthenticated,
     accountId: authState.accountId,
@@ -252,9 +217,6 @@ export function getAuthStatus() {
   };
 }
 
-/**
- * Logout / invalidar sesión
- */
 export function logout() {
   authState = {
     gravityCookie: '',
@@ -265,11 +227,6 @@ export function logout() {
   };
   console.log('🚪 Logged out from GRVT');
 }
-
-// ─── Per-instance auth (multi-tenant) ────────────────────────────────
-// These variants accept an explicit AuthState + apiKey so each
-// GRVTClient instance can have its own cookie session. The global
-// functions above are kept for backward compat with the singleton.
 
 export async function authenticateWithKey(
   apiKey: string,
@@ -284,22 +241,15 @@ export async function authenticateWithKey(
       },
       body: JSON.stringify({ api_key: apiKey }),
     });
-        if (!response.ok) return false;
-    
-    // GRVT devuelve status y sub_account_id en el body
+    if (!response.ok) return false;
     const body = await response.json() as any;
     if (body.status !== 'success') return false;
-    
-    // Account ID: primero header, si no del body
-    const accountId = response.headers.get('x-grvt-account-id') || 
+    const accountId = response.headers.get('x-grvt-account-id') ||
                       String(body.sub_account_id || '');
     if (!accountId) return false;
-    
-    // Cookie de sesión (puede venir en header)
     const setCookie = response.headers.get('set-cookie') || '';
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
     const gravityCookie = gravityMatch?.[1] || '';
-    
     const now = Date.now();
     state.gravityCookie = gravityCookie;
     state.accountId = accountId;
@@ -320,7 +270,6 @@ export async function authenticatedRequestWithState(
   body: object = {},
   options: { method?: string; timeout?: number } = {}
 ): Promise<any> {
-  // Re-auth if needed
   if (!state.isAuthenticated || (state.expiresAt - Date.now()) < 60 * 60 * 1000) {
     const ok = await authenticateWithKey(apiKey, state);
     if (!ok) throw new Error('GRVT re-authentication failed');
