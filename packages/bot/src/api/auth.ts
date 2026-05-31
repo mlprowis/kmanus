@@ -78,8 +78,7 @@ export async function authenticateGRVT(): Promise<boolean> {
     if (!response.ok) return false;
     const body = await response.json() as any;
     if (body.status !== 'success') return false;
-    const accountId = response.headers.get('x-grvt-account-id') ||
-                      String(body.sub_account_id || '');
+    const accountId = response.headers.get('x-grvt-account-id') || String(body.sub_account_id || '');
     if (!accountId) return false;
     const setCookie = response.headers.get('set-cookie') || '';
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
