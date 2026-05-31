@@ -242,6 +242,7 @@ export async function authenticateWithKey(
       body: JSON.stringify({ api_key: apiKey }),
     });
     if (!response.ok) return false;
+    console.log('🔍 GRVT headers:', JSON.stringify(Object.fromEntries((response.headers as any).entries())));
     const body = await response.json() as any;
     if (body.status !== 'success') return false;
     const accountId = response.headers.get('x-grvt-account-id') ||
