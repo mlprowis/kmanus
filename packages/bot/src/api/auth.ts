@@ -75,36 +75,18 @@ export async function authenticateGRVT(): Promise<boolean> {
 
     console.log(`📡 Login response: ${response.status}`);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('❌ Login failed:', errorText);
-      return false;
-    }
-
-    // Extraer cookie y account ID de headers
-    const setCookie = response.headers.get('set-cookie');
-    const accountId = response.headers.get('x-grvt-account-id');
-
-    if (!setCookie || !accountId) {
-      console.error('❌ Missing auth headers in response');
-      console.log('Response headers:', Object.fromEntries(response.headers.entries()));
-      return false;
-    }
-
-    // Extraer gravity cookie value
+    if (!response.ok) return false;
+    const body = await response.json() as any;
+    if (body.status !== 'success') return false;
+    const accountId = response.headers.get('x-grvt-account-id') ||
+                      String(body.sub_account_id || '');
+    if (!accountId) return false;
+    const setCookie = response.headers.get('set-cookie') || '';
     const gravityMatch = setCookie.match(/gravity=([^;]+)/);
-    if (!gravityMatch || !gravityMatch[1]) {
-      console.error('❌ Gravity cookie not found in Set-Cookie header');
-      return false;
-    }
-
-    const gravityCookie = gravityMatch[1];
+    const gravityCookie = gravityMatch?.[1] || '';
     const now = Date.now();
-    
-    // Actualizar estado auth
-    authState = {
-      gravityCookie,
-      accountId,
+    state.gravityCookie = gravityCookie;
+    state.accountId = accountId;
       isAuthenticated: true,
       expiresAt: now + (23 * 60 * 60 * 1000), // Expira en 23h (safety margin)
       loginTime: now
